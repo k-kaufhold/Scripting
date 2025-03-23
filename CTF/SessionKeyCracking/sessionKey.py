@@ -1,88 +1,71 @@
-import hmac
 import hashlib
-from binascii import unhexlify
-from Crypto.Cipher import ARC4
-import sys
+import hmac
+import argparse
+import binascii
 
-def get_response_key_nt(nt_hash, user, domain):
-    user_domain = (user.upper() + domain.upper()).encode('utf-16le')
-    return hmac.new(nt_hash, user_domain, hashlib.md5).digest()
+# stolen from impacket. Thank you all for your wonderful contributions to the community
+try:
+    from Cryptodome.Cipher import ARC4
+    from Cryptodome.Cipher import DES
+    from Cryptodome.Hash import MD4
+except Exception as e:
+    print("Warning: You don't have any crypto installed. You need pycryptodomex")
+    print("See https://pypi.org/project/pycryptodomex/")
+    raise e
 
-def get_key_exchange_key(response_key_nt, nt_proof_str):
-    return hmac.new(response_key_nt, nt_proof_str, hashlib.md5).digest()
+def generate_encrypted_session_key(key_exchange_key, exported_session_key):
+    cipher = ARC4.new(key_exchange_key)
+    cipher_encrypt = cipher.encrypt
+    session_key = cipher_encrypt(exported_session_key)
+    return session_key
 
-def decrypt_session_key(key_exchange_key, encrypted_session_key):
-    rc4 = ARC4.new(key_exchange_key)
-    return rc4.decrypt(encrypted_session_key)
+parser = argparse.ArgumentParser(description="Calculate the Random Session Key based on data from a PCAP (maybe).")
+parser.add_argument("-u", "--user", required=True, help="User name")
+parser.add_argument("-d", "--domain", required=True, help="Domain name")
+parser.add_argument("-p", "--password", help="Password of User")
+parser.add_argument("-ph", "--passwordhash", help="NTLM Hash of the Password (in Hex)")
+parser.add_argument("-n", "--ntproofstr", required=True, help="NTProofStr. This can be found in PCAP (provide Hex Stream)")
+parser.add_argument("-k", "--key", required=True, help="Encrypted Session Key. This can be found in PCAP (provide Hex Stream)")
+parser.add_argument("-v", "--verbose", action="store_true", help="Increase output verbosity")
 
-def main():
-    if len(sys.argv) < 5 or len(sys.argv) > 7:
-        print("Usage for NT hash method: python script.py nt_hash username domain nt_hash_value NTProofStr EncryptedSessionKey")
-        print("Usage for password method: python script.py password username domain password_value NTProofStr EncryptedSessionKey")
-        sys.exit(1)
+args = parser.parse_args()
 
-    method = sys.argv[1]
-    user = sys.argv[2]
-    domain = sys.argv[3]
-    
-    if method == 'nt_hash':
-        if len(sys.argv) != 7:
-            print("Usage: python script.py nt_hash username domain nt_hash_value NTProofStr EncryptedSessionKey")
-            sys.exit(1)
-        
-        try:
-            nt_hash = unhexlify(sys.argv[4])
-            NTProofStr = unhexlify(sys.argv[5])
-            EncryptedSessionKey = unhexlify(sys.argv[6])
-        except Exception as e:
-            print(f"Error parsing hex values: {e}")
-            sys.exit(1)
+# Validate that either password or password hash is provided
+if not args.password and not args.passwordhash:
+    parser.error("You must provide either --password or --passwordhash")
 
-        response_key_nt = get_response_key_nt(nt_hash, user, domain)
-        print(f"ResponseKeyNT: {response_key_nt.hex()}")
+# Upper Case User and Domain
+user = str(args.user).upper().encode('utf-16le')
+domain = str(args.domain).upper().encode('utf-16le')
 
-        key_exchange_key = get_key_exchange_key(response_key_nt, NTProofStr)
-        print(f"KeyExchangeKey: {key_exchange_key.hex()}")
+# If password is provided, calculate the NTLM hash
+if args.password:
+    passw = args.password.encode('utf-16le')
+    hash1 = hashlib.new('md4', passw)
+    password_hash = hash1.digest()
+else:
+    # Use provided password hash (in hex) instead of calculating it
+    password_hash = binascii.unhexlify(args.passwordhash)
 
-        random_session_key = decrypt_session_key(key_exchange_key, EncryptedSessionKey)
-        print(f"RandomSessionKey: {random_session_key.hex()}")
+# Calculate the ResponseNTKey
+h = hmac.new(password_hash, digestmod=hashlib.md5)
+h.update(user + domain)
+resp_nt_key = h.digest()
 
-    elif method == 'password':
-        if len(sys.argv) != 7:
-            print("Usage: python script.py password username domain password_value NTProofStr EncryptedSessionKey")
-            sys.exit(1)
+# Use NTProofSTR and ResponseNTKey to calculate Key Exchange Key
+nt_proof_str = binascii.unhexlify(args.ntproofstr)
+h = hmac.new(resp_nt_key, digestmod=hashlib.md5)
+h.update(nt_proof_str)
+key_exch_key = h.digest()
 
-        password = sys.argv[4]
-        try:
-            NTProofStr = unhexlify(sys.argv[5])
-            EncryptedSessionKey = unhexlify(sys.argv[6])
-        except Exception as e:
-            print(f"Error parsing hex values: {e}")
-            sys.exit(1)
+# Calculate the Random Session Key by decrypting Encrypted Session Key with Key Exchange Key via RC4
+r_sess_key = generate_encrypted_session_key(key_exch_key, binascii.unhexlify(args.key))
 
-        # Step 1: MD4 hash of the password
-        try:
-            md4_hash = hashlib.new('md4', password.encode('utf-16le')).digest()
-        except Exception as e:
-            print(f"Error hashing password: {e}")
-            sys.exit(1)
-
-        print(f"MD4 Hash of Password: {md4_hash.hex()}")
-
-        # Step 2: Calculate ResponseKeyNT using HMAC-MD5
-        response_key_nt = get_response_key_nt(md4_hash, user, domain)
-        print(f"ResponseKeyNT: {response_key_nt.hex()}")
-
-        # Step 3: Calculate KeyExchangeKey using HMAC-MD5
-        key_exchange_key = get_key_exchange_key(response_key_nt, NTProofStr)
-        print(f"KeyExchangeKey: {key_exchange_key.hex()}")
-
-        # Step 4: Decrypt EncryptedSessionKey using RC4
-        random_session_key = decrypt_session_key(key_exchange_key, EncryptedSessionKey)
-        print(f"RandomSessionKey: {random_session_key.hex()}")
-
-    else:
-        print("Invalid method. Use 'nt_hash' or 'password'.")
-
-if __name__ == "__main__":
-    main()
+if args.verbose:
+    print("USER WORK: " + user.decode('utf-16le') + domain.decode('utf-16le'))
+    if args.password:
+        print("PASS HASH: " + binascii.hexlify(password_hash).decode())
+    print("RESP NT:   " + binascii.hexlify(resp_nt_key).decode())
+    print("NT PROOF:  " + binascii.hexlify(nt_proof_str).decode())
+    print("KeyExKey:  " + binascii.hexlify(key_exch_key).decode())
+print("Random SK: " + binascii.hexlify(r_sess_key).decode())
